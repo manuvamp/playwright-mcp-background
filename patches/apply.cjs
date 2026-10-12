@@ -550,6 +550,16 @@ Tool "\${name}" ran, but reading the page afterwards timed out (the page is stuc
           throw new Error("The browser is running but the background Playwright extension is not connected to broker.cjs (http://127.0.0.1:" + brokerPort + "/status). Not launching " + browserExe + " because that would take over the user's screen. Ask the user to check the Playwright Extension card in the browser's extensions page (enabled, no errors, reload).");
 `,
   },
+  {
+    // When the browser is closed and the MCP has to launch it, start it with --silent-debugger-extension-api so the
+    // extension's debugger attach doesn't show the "Playwright Extension started debugging this browser" bar
+    // (the browser's own shortcuts and link handler need the same flag, see README).
+    marker: '/*SILENT_DEBUGGER*/',
+    needle: '        args.push(href);\n',
+    replacement: `        /*SILENT_DEBUGGER*/ args.push("--silent-debugger-extension-api");
+        args.push(href);
+`,
+  },
 ];
 
 for (const p of patches) {

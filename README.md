@@ -24,6 +24,7 @@ This repo is a set of string-replacement patches for the installed `playwright-c
 - `mcp-supervisor.cjs` runs the real MCP server as a child process, restarts it transparently when it dies or when `coreBundle.js` is re-patched, and replays the MCP handshake, so open chats do not need to reconnect.
 - File upload fixes: the file is read in Node and injected via `DataTransfer`. Works for single/multiple files, hidden inputs, iframes, shadow DOM, unicode names and folders (`webkitdirectory`).
 - New tool `browser_set_input_files`: sets files on an `<input type=file>` directly (snapshot ref or selector), no click or file chooser needed.
+- No "Playwright Extension started debugging this browser" bar, when the browser runs with `--silent-debugger-extension-api` (see "Hide the debugging bar" below). The MCP adds the flag itself when it has to launch the browser.
 - Optional: the tab group title can be the title of the T3 Code thread running the agent (see "Group name" below).
 
 ## Requirements
@@ -92,6 +93,21 @@ This repo is a set of string-replacement patches for the installed `playwright-c
    ```
 
    Keep `--extension` and the token. If you already have an entry with the `cli.js` args, `node patches/use-supervisor.cjs [--server <name>]` inserts the supervisor in front of it (idempotent).
+
+## Hide the debugging bar
+
+Chromium shows a "Playwright Extension" started debugging this browser bar on every window while an extension uses the `chrome.debugger` API. No extension can hide it; the browser has to be started with `--silent-debugger-extension-api`. The patched MCP passes it when it launches the browser, but usually you start the browser yourself, so add it to the places that do:
+
+- Shortcuts (taskbar pin, Start Menu, desktop): add `--silent-debugger-extension-api` to the shortcut's arguments. The shared Start Menu and Public Desktop shortcuts need admin rights.
+- Links opened from other apps when the browser is closed (Windows, Brave shown; use `ChromeHTML` for Chrome). A per-user override, no admin needed:
+
+  ```powershell
+  $k = 'HKCU:\Software\Classes\BraveHTML\shell\open\command'
+  New-Item -Path $k -Force | Out-Null
+  Set-ItemProperty -Path $k -Name '(default)' -Value '"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe" --silent-debugger-extension-api --single-argument %1'
+  ```
+
+Then fully quit the browser (menu → Exit) and start it again. Trade-off: the flag silences this warning for every extension, not only Playwright, so only use it with extensions you trust. Browser updates can rewrite shortcuts; if the bar comes back, check the running browser's command line for the flag.
 
 ## Re-apply after Playwright updates
 
