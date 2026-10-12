@@ -1,0 +1,14 @@
+playwright-mcp-background
+Copyright 2026 the playwright-mcp-background contributors
+
+This project patches Playwright (playwright-core) and the Playwright MCP
+server (@playwright/mcp) and builds a modified local copy of the Playwright
+Extension. Playwright, Playwright MCP and the Playwright Extension are
+Copyright (c) Microsoft Corporation and licensed under the Apache License,
+Version 2.0. See https://github.com/microsoft/playwright-mcp and
+https://github.com/microsoft/playwright.
+
+This project is an independent work. It is not affiliated with, endorsed by,
+or sponsored by Microsoft. Microsoft's code is not redistributed here: the
+patch scripts modify an installed copy of @playwright/mcp on your machine and
+build the extension from the copy you already have installed.

@@ -1,0 +1,8 @@
+node_modules/
+output/
+extension-bg/
+extension-src/
+*.log
+*.log.old
+*.png
+*.bak-original
