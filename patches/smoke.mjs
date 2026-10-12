@@ -232,7 +232,10 @@ fg.stdout.on('data', (d) => {
     fgSamples.push(line);
     // Only agent windows count: our test pages ("pw-smoke", "Example Domain") or an untitled browser
     // window (e.g. "Page unresponsive" prompt). The user switching to their own browser tabs is not a steal.
-    const agentWindow = BROWSER_FG.test(line) && (/pw-smoke|Example Domain/.test(line) || BROWSER_FG_UNTITLED.test(line));
+    // If the user wasn't in the browser when the suite started, the browser coming forward on any tab is a
+    // steal (2026-10-12: a popup refocus raised the user's own browser window, which the title check missed).
+    const browserAtStart = BROWSER_FG.test(startFg);
+    const agentWindow = BROWSER_FG.test(line) && (!browserAtStart || /pw-smoke|Example Domain/.test(line) || BROWSER_FG_UNTITLED.test(line));
     if (agentWindow && line !== lastSteal) { steals++; stealLines.push(new Date().toISOString().slice(11, 19) + ' ' + line); }
     lastSteal = agentWindow ? line : null;
   }

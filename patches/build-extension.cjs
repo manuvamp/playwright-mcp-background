@@ -127,6 +127,18 @@ patch('lib/background.mjs', [
     '\t\tif (this._hasEverAttached && this._attachedTabs.size === 0 && this._pendingReattach.size === 0) this.close("All controlled tabs detached");\n',
     '\t\t// local build: keep the connection open with zero tabs (see build-extension.cjs 4a)\n',
   ],
+  // 4e) A tab the user opened from an agent tab (link, middle-click, Ctrl+T while viewing it) is theirs,
+  //     not the agent's: don't announce it to the MCP (it auto-attached it, pulled it into the collapsed
+  //     group and could make it the agent's current tab), and push it out of the 🤖 group the browser
+  //     put it in. See isUserOpenedTab in the broker region.
+  [
+    '\t\t\tcase "chrome.tabs.onCreated": return args[0].openerTabId;\n',
+    '\t\t\tcase "chrome.tabs.onCreated": return isUserOpenedTab(args[0]) ? void 0 : args[0].openerTabId;\n',
+  ],
+  [
+    '\t\t\tif (this._isTabReserved(tabId)) {\n',
+    '\t\t\tif (this._isTabReserved(tabId) || userOpenedTabs.has(tabId)) {\n',
+  ],
   // 4b) Never let Memory Saver discard a tab an agent is attached to.
   [
     '\t_onTabAttached(tabId) {\n\t\tthis._updateBadge(tabId, CONNECTED_BADGE);\n',
@@ -225,32 +237,72 @@ if (chrome.alarms) {
 	});
 }
 // Popups opened by agent pages (target=_blank, window.open) must not switch the user's tab or window.
-// Remember the user's last active tab per window and last focused window; when a tab whose opener is
-// an agent tab appears, adopt it as an agent tab and give the user's tab/window back.
+// Remember the user's last active tab per window; when a tab whose opener is an agent tab appears,
+// adopt it as an agent tab and give the user's tab back.
 var lastUserTab = /* @__PURE__ */ new Map();
-var lastUserWindow = null;
 async function isAgentTab(tabId) {
 	if (tabId === void 0) return false;
+	if (userOpenedTabs.has(tabId)) return false;
 	if ((await agentTabIds()).has(tabId)) return true;
 	const tab = await chrome.tabs.get(tabId).catch(() => null);
 	if (!tab || tab.groupId === void 0 || tab.groupId < 0) return false;
 	const group = await chrome.tabGroups.get(tab.groupId).catch(() => null);
 	return !!group?.title?.startsWith(PLAYWRIGHT_GROUP_TITLE);
 }
+// Who opened a new tab: the user or an agent? Agents only work in background tabs, so a tab whose
+// opener is the tab on screen (the active tab of the last focused browser window) was opened by the
+// user, even if that tab is an agent's (they were reviewing it). Before 2026-10-12 every tab opened from
+// an agent tab was adopted: the user got bounced to an old tab and the agent took the new one over.
+// Decided once per tab, synchronously (the relay's onCreated forwarder asks too, and must get the same answer).
+var activeTabByWindow = /* @__PURE__ */ new Map();
+var previousActiveTabByWindow = /* @__PURE__ */ new Map();
+var activatedAtByWindow = /* @__PURE__ */ new Map();
+var lastFocusedWindow = null;
+var userOpenedTabs = /* @__PURE__ */ new Set();
+var classifiedTabs = /* @__PURE__ */ new Set();
+function isUserOpenedTab(tab) {
+	if (tab?.id === void 0 || tab.openerTabId === void 0) return false;
+	if (!classifiedTabs.has(tab.id)) {
+		classifiedTabs.add(tab.id);
+		if (lastFocusedWindow !== null && activeTabByWindow.get(lastFocusedWindow) === tab.openerTabId) userOpenedTabs.add(tab.id);
+	}
+	return userOpenedTabs.has(tab.id);
+}
+chrome.tabs.onActivated.addListener(({ tabId, windowId }) => {
+	previousActiveTabByWindow.set(windowId, activeTabByWindow.get(windowId));
+	activeTabByWindow.set(windowId, tabId);
+	activatedAtByWindow.set(windowId, Date.now());
+});
+chrome.windows.onFocusChanged.addListener((windowId) => {
+	if (windowId !== chrome.windows.WINDOW_ID_NONE) lastFocusedWindow = windowId;
+});
+chrome.tabs.onRemoved.addListener((tabId) => {
+	classifiedTabs.delete(tabId);
+	userOpenedTabs.delete(tabId);
+});
+chrome.windows.getLastFocused().then((w) => {
+	if (lastFocusedWindow === null && w?.id !== void 0) lastFocusedWindow = w.id;
+}).catch(() => {});
 chrome.tabs.onActivated.addListener(async ({ tabId, windowId }) => {
 	const tab = await chrome.tabs.get(tabId).catch(() => null);
-	if (!tab || await isAgentTab(tabId) || await isAgentTab(tab.openerTabId)) return;
+	if (!tab || await isAgentTab(tabId) || (!userOpenedTabs.has(tabId) && await isAgentTab(tab.openerTabId))) return;
 	lastUserTab.set(windowId, tabId);
 });
-chrome.windows.onFocusChanged.addListener(async (windowId) => {
-	if (windowId === chrome.windows.WINDOW_ID_NONE) return;
-	const [active] = await chrome.tabs.query({ windowId, active: true }).catch(() => []);
-	if (active && !await isAgentTab(active.id) && !await isAgentTab(active.openerTabId)) lastUserWindow = windowId;
-});
 chrome.tabs.query({ active: true }).then(async (tabs) => {
-	for (const t of tabs) if (!lastUserTab.has(t.windowId) && !await isAgentTab(t.id) && !await isAgentTab(t.openerTabId)) lastUserTab.set(t.windowId, t.id);
+	for (const t of tabs) {
+		if (!activeTabByWindow.has(t.windowId)) activeTabByWindow.set(t.windowId, t.id);
+		if (!lastUserTab.has(t.windowId) && !await isAgentTab(t.id) && !await isAgentTab(t.openerTabId)) lastUserTab.set(t.windowId, t.id);
+	}
 }).catch(() => {});
 chrome.tabs.onCreated.addListener(async (tab) => {
+	if (isUserOpenedTab(tab)) {
+		// The user's tab: leave it active and get it out of the collapsed agent group the browser put it in.
+		if (tab.groupId !== void 0 && tab.groupId >= 0) {
+			const group = await chrome.tabGroups.get(tab.groupId).catch(() => null);
+			if (group?.title?.startsWith(PLAYWRIGHT_GROUP_TITLE)) await ungroupTabs([tab.id]);
+		}
+		return;
+	}
 	// Fast path first (no awaits) so a popup that grabbed the active tab is reverted within ms.
 	const knownAgentOpener = tab.openerTabId !== void 0 && agentTabMemory.has(tab.openerTabId);
 	if (knownAgentOpener && tab.active && lastUserTab.has(tab.windowId)) chrome.tabs.update(lastUserTab.get(tab.windowId), { active: true }).catch(() => {});
@@ -258,12 +310,10 @@ chrome.tabs.onCreated.addListener(async (tab) => {
 	await rememberAgentTab(tab.id);
 	const opener = await chrome.tabs.get(tab.openerTabId).catch(() => null);
 	if (opener && tab.windowId !== opener.windowId) {
-		// A popup window: minimize it and hand focus back to the user's window if they were in the browser.
+		// A popup window: minimize it so the OS hands focus back to whatever the user was using. Never
+		// focus a browser window here: when they were in another app that raised the browser over it (2026-10-12).
 		const win = await chrome.windows.get(tab.windowId).catch(() => null);
-		if (win?.focused) {
-			await chrome.windows.update(tab.windowId, { state: "minimized" }).catch(() => {});
-			if (lastUserWindow !== null) await chrome.windows.update(lastUserWindow, { focused: true }).catch(() => {});
-		}
+		if (win?.focused) await chrome.windows.update(tab.windowId, { state: "minimized" }).catch(() => {});
 		return;
 	}
 	if (tab.active) {
@@ -402,9 +452,12 @@ chrome.tabs.onActivated.addListener(({ tabId, windowId }) => setTimeout(async ()
 	const back = lastUserTab.get(windowId);
 	if (back !== void 0 && back !== tabId) chrome.tabs.update(back, { active: true }).catch(() => {});
 }, 300));
-chrome.tabs.onRemoved.addListener((tabId) => {
+chrome.tabs.onRemoved.addListener((tabId, removeInfo) => {
 	if (!agentTabLastUse.has(tabId) && !tabCloseReasons.has(tabId)) return;
-	lastAgentTabRemovedAt = Date.now();
+	// Only when the closed tab was on screen (the browser may report the neighbour's activation first):
+	// another session closing a background tab while the user opens an agent tab must not move them.
+	const windowId = removeInfo?.windowId;
+	if (activeTabByWindow.get(windowId) === tabId || previousActiveTabByWindow.get(windowId) === tabId && Date.now() - (activatedAtByWindow.get(windowId) ?? 0) < 1500) lastAgentTabRemovedAt = Date.now();
 	logTabEvent({ tabId, url: agentTabUrls.get(tabId), action: "closed", reason: tabCloseReasons.get(tabId) || "closed by the user or browser" });
 	agentTabLastUse.delete(tabId);
 	agentTabUrls.delete(tabId);

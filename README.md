@@ -16,7 +16,8 @@ This repo is a set of string-replacement patches for the installed `playwright-c
 - A broker (default port 8770) lets the MCP server connect through the already-running extension instead of launching the browser executable, which always raises the browser.
 - Hidden tabs are kept unfrozen (the browser freezes background tabs and stops their timers and network callbacks).
 - In hidden tabs, mouse moves/hover, clicks, double/right clicks, wheel and HTML5 drag-and-drop are performed as DOM events, and animation-frame / in-page-timer waits that the browser throttles are skipped.
-- Popup handling: links that open a new tab are opened as background tabs; `window.open` and popup windows are adopted as agent tabs and your own tab/window is given back.
+- Popup handling: links that open a new tab are opened as background tabs; `window.open` tabs and popup windows from agent pages are adopted as agent tabs, your own tab is given back and popup windows are minimized (the extension never focuses a browser window).
+- Your tabs stay yours: a tab you open from an agent tab you're looking at (link, middle-click, Ctrl+T) isn't adopted, grouped or handed to the agent, and you aren't bounced to another tab. The extension tells the two apart by the opener: agents only work in background tabs, so a tab opened from the tab on your screen is yours.
 - Idle agent tabs are closed automatically (default 10 minutes with no command), skipping tabs with unsaved work (filled fields, ticked boxes, picked files, password fields, editor text, large cross-origin embeds) and tabs you are looking at.
 - Hung-tab self-heal: after a slow or failed call the tab is pinged; if it does not answer, its JS is terminated, a fresh tab is opened and the dead one closed. This also avoids the browser's "Page unresponsive" prompt.
 - Tool-call time caps: every call is capped (default 120 s) and the page read-back after a call is capped at 30 s, so an agent is never stuck on a silent hang.
@@ -144,7 +145,8 @@ The tab group is titled after what the session is working on. Order: `PLAYWRIGHT
 | Page stuck in an endless script / hung renderer | After any slow (over 4 s) or failed call the tab is pinged; if it does not answer in 3 s its JS is terminated, a fresh tab is opened and the dead tab closed. |
 | Browser freezes the background tab | Hidden agent tabs are kept unfrozen every 2 s. |
 | `alert` / `confirm` / `prompt` | The call returns at once with "Modal state"; self-heal skips tabs with an open dialog. Use `browser_handle_dialog`. |
-| Site opens a popup (`target=_blank`, `window.open`, popup window) | Links: default cancelled, URL opened as a background tab. `window.open`: the extension switches your tab/window back. |
+| Site opens a popup (`target=_blank`, `window.open`, popup window) | Links: default cancelled, URL opened as a background tab. `window.open`: the extension switches your tab back; a popup window is minimized. |
+| You open a link or new tab from an agent tab you're viewing | It's yours: not adopted, grouped or shown to the agent, and you stay on it. |
 | You close the agent's tabs | The connection stays open; the next call opens a new tab. |
 | Agent tab left open after its work is done | Closed after 10 minutes without a command, if it is not on screen and has no unsaved work. |
 | Extension reloaded / browser restarted | The next call reconnects through the broker. |
@@ -159,8 +161,9 @@ Behaviour to know about: in agent tabs `document.visibilityState` is normally `"
 
 ## Testing
 
-- `node patches/smoke.mjs [--only name1,name2] [--skip-disruptive]`: 13 end-to-end scenarios against the real browser in background tabs (connect, uploads, input events, dialogs, popups, hung page, reload, broker restart). It samples the foreground window every 250 ms and fails if a browser window takes focus. It uses `bridge.mjs` and your configured MCP server entry. The "disruptive" cases briefly disconnect every agent session on the machine, so use `--skip-disruptive` when others are using the browser.
+- `node patches/smoke.mjs [--only name1,name2] [--skip-disruptive]`: 13 end-to-end scenarios against the real browser in background tabs (connect, uploads, input events, dialogs, popups, hung page, reload, broker restart). It samples the foreground window every 250 ms and fails if a browser window takes focus (any browser window, if the browser wasn't in front when the run started). The popups scenario opens a real popup window, which the browser shows in front as it is created, so don't run it while you're using the machine. It uses `bridge.mjs` and your configured MCP server entry. The "disruptive" cases briefly disconnect every agent session on the machine, so use `--skip-disruptive` when others are using the browser.
 - `node patches/test-supervisor.cjs [--server <name>]`: exercises `mcp-supervisor.cjs` (handshake, child killed idle, child killed mid-call, code update while idle, clean exit).
+- `node patches/sim-tabs.cjs [extension-dir]`: replays tab scenarios (you vs. agent opening tabs, popups, popup windows, agents closing the tab you're viewing) against the built extension in a simulated Chromium, with nothing on screen. Fails if the extension ever focuses a window. `SIM_DISABLE_FIX=1` restores the old "every tab opened from an agent tab is the agent's" behaviour, so you can see the scenarios catch it.
 - `node patches/smoke-extension.mjs`: loads the built `extension-bg/lib/background.mjs` against a mocked `chrome` API to catch startup errors without touching the browser.
 
 Run them after any patch, Playwright update or extension rebuild.
@@ -171,6 +174,8 @@ Run them after any patch, Playwright update or extension rebuild.
 - Only tested on Windows with Brave. Other Chromium browsers and operating systems may need changes (process detection, paths, launcher).
 - Events in hidden tabs are synthetic; a few widgets that insist on trusted input or a visible tab will not respond. Sites that use `window.showOpenFilePicker` (no `<input>`) cannot be automated for uploads.
 - `accept=` on file inputs is not enforced by the upload fallback; pick the right file type.
+- A popup window an agent's click opens (`window.open` with window features, e.g. "Sign in with Google") is created as a real window, and the browser shows it in front for a moment before the extension minimizes it. Popups that open as tabs don't do this.
+- When you open a tab from an agent tab you're viewing, the tab is yours, so the agent won't see a popup it triggered while you were looking at that tab.
 - The extension auth token grants control of your browser through the extension. Keep it out of git, logs and screenshots.
 
 ## License
