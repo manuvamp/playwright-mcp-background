@@ -1,6 +1,6 @@
 // Tests mcp-supervisor.cjs like Claude Code would use it: handshake, tool calls, child killed
 // mid-session, child killed during a call, and a code update while idle. Uses background tabs only.
-//   node patches/test-supervisor.cjs [--server <name>]   (name defaults to PW_MCP_SERVER_NAME or "brave")
+//   node patches/test-supervisor.cjs [--server <name>] [--touch-live-bundle]   (name defaults to PW_MCP_SERVER_NAME or "brave")
 const { spawn, execFileSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
@@ -65,16 +65,22 @@ const check = (name, ok, detail) => results.push(`${ok ? 'PASS' : 'FAIL'}  ${nam
   r = await call('browser_navigate', { url: 'https://example.com/?pw-sup-3' });
   check('  ... and the following call works', !/ERROR|TIMEOUT/.test(text(r)), text(r));
 
-  // 3) code update while idle -> child replaced automatically
-  const pid3 = childPid();
-  const bundle = path.join(ROOT, 'node_modules', 'playwright-core', 'lib', 'coreBundle.js');
-  const now = new Date();
-  fs.utimesSync(bundle, now, now);
-  await sleep(8000);
-  const pid4 = childPid();
-  r = await call('browser_navigate', { url: 'https://example.com/?pw-sup-4' });
-  check('code update -> fresh child picks it up', pid4 && pid4 !== pid3 && !/ERROR|TIMEOUT/.test(text(r)), `child ${pid3} -> ${pid4}; ${text(r)}`);
-  check('client told tools may have changed', notes.includes('notifications/tools/list_changed'), notes.join(','));
+  // 3) code update while idle -> child replaced automatically. Touching the bundle restarts the idle
+  //    children of EVERY open chat using this install too (their tabs close), so only on request:
+  //    --touch-live-bundle, when no other chat is using the browser.
+  if (process.argv.includes('--touch-live-bundle')) {
+    const pid3 = childPid();
+    const bundle = path.join(path.dirname(cfg.args[cliIdx]), '..', '..', 'playwright-core', 'lib', 'coreBundle.js');
+    const now = new Date();
+    fs.utimesSync(bundle, now, now);
+    await sleep(8000);
+    const pid4 = childPid();
+    r = await call('browser_navigate', { url: 'https://example.com/?pw-sup-4' });
+    check('code update -> fresh child picks it up', pid4 && pid4 !== pid3 && !/ERROR|TIMEOUT/.test(text(r)), `child ${pid3} -> ${pid4}; ${text(r)}`);
+    check('client told tools may have changed', notes.includes('notifications/tools/list_changed'), notes.join(','));
+  } else {
+    results.push('skip  code update while idle (pass --touch-live-bundle; restarts other chats\' idle browser servers)');
+  }
 
   sup.stdin.end();
   await sleep(1500);

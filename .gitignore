@@ -2,7 +2,14 @@ node_modules/
 output/
 extension-bg/
 extension-src/
+extension-next/
+extension-prev/
+extension-*/
+runtime/
+runtime-*/
+lane-ids/
+deploy.log
 *.log
 *.log.old
 *.png
-*.bak-original
+*.bak*

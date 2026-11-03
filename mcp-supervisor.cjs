@@ -10,7 +10,9 @@ const fs = require('fs');
 const path = require('path');
 
 const [childScript, ...childArgs] = process.argv.slice(2);
-const BUNDLE = path.join(__dirname, 'node_modules', 'playwright-core', 'lib', 'coreBundle.js');
+// The bundle of the install it runs (<install>/node_modules/@playwright/mcp/cli.js): <repo>/node_modules,
+// or <repo>/runtime[-N] when you keep versioned installs (see install-dir.cjs).
+const BUNDLE = path.join(path.dirname(childScript), '..', '..', 'playwright-core', 'lib', 'coreBundle.js');
 const LOG = path.join(__dirname, 'supervisor.log');
 const log = (m) => { try { fs.appendFileSync(LOG, `${new Date().toISOString()} [${process.pid}] ${m}\n`); } catch {} };
 
