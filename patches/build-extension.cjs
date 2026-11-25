@@ -1142,6 +1142,8 @@ async function saveUserTabs() {
 	await chrome.storage?.local?.set({ [USER_TABS_KEY]: Object.fromEntries([...userTabMemory].map((id) => [id, userTabInfo.get(id) ?? {}])) }).catch(() => {});
 }
 async function rememberUserTab(tabId, info = {}) {
+	// Handed to or taken by a session now: an older release still waiting for a retry must not detach it.
+	pendingUserReleases.delete(tabId);
 	await userTabsLoaded;
 	userTabMemory.add(tabId);
 	userTabInfo.set(tabId, info);
@@ -1154,7 +1156,21 @@ async function forgetUserTab(tabId) {
 	await saveUserTabs();
 }
 // Back to the user: out of the 🤖 group, debugger off (the MCP sees the page go), page left as it is.
+// Out of the group first, and the user's mark kept until that worked: ungrouping fails while they drag
+// tabs, and an unmarked tab left in an agent group was closed by a later cleanup (after an extension restart).
+// Such releases are retried on the orphan alarm (pendingUserReleases, build-extension.cjs 17).
+var pendingUserReleases = /* @__PURE__ */ new Map();
 async function releaseUserTab(tabId, reason) {
+	pendingUserReleases.delete(tabId);
+	const before = await chrome.tabs.get(tabId).catch(() => null);
+	if (before && await inAgentGroup(before)) {
+		await ungroupTabs([tabId]);
+		const after = await chrome.tabs.get(tabId).catch(() => null);
+		if (after && await inAgentGroup(after)) {
+			pendingUserReleases.set(tabId, reason);
+			return;
+		}
+	}
 	await forgetUserTab(tabId);
 	const ours = await agentTabIds();
 	if (ours.delete(tabId)) await saveAgentTabIds(ours);
@@ -1212,6 +1228,466 @@ chrome.runtime.onStartup.addListener(() => {
     `\t\t\t\t\t// A tab the user moved into the group while it waited is handed to this chat (14).
 					if (!o.tabIds.includes(id) && !userTabMemory.has(id) && !(await agentTabIds()).has(id)) await rememberUserTab(id, { handedTo: name });
 					// Tell the MCP server (chrome.tabs.onCreated), which attaches to it.
+`,
+  ],
+  // 16) Another extension's frame in an agent tab (typing into a form field made the browser close
+  //     the tab about 4 seconds later). LastPass mounts its in-field menu, an iframe of
+  //     chrome-extension://hdokiejnpimakedhajhdlcegeplioahd/webclient-infield.html in a closed shadow root,
+  //     shortly after text is typed into a form field. Chromium never lets one extension's debugger stay on
+  //     a page that holds another extension's frame: it detaches ("target_closed"), and the re-attach fails
+  //     with "Cannot access a chrome-extension:// URL of different extension", so the MCP loses the tab
+  //     (the agent sees "No open tabs"; the tab itself sat in the group until the orphan grace closed it).
+  //     Nothing in the page can stop it (the iframe and its navigation start in one task, data-lpignore is
+  //     not honoured for this menu). So when attaching fails for that reason, remove every frame of another
+  //     extension from the tab (closed shadow roots included, via chrome.dom) and attach again: the page and
+  //     what was typed stay as they are. Any extension that injects frames (password managers, Grammarly...)
+  //     is handled the same way. The 3 s re-attach cooldown would drop the tab on the next field typed, so a
+  //     tab recovered this way may re-attach FOREIGN_FRAME_BUDGET times a minute.
+  [
+    'var REATTACH_COOLDOWN_MS = 3e3;\n',
+    `var REATTACH_COOLDOWN_MS = 3e3;
+//#region local build: other extensions' frames (build-extension.cjs 16)
+var FOREIGN_FRAME_ERROR = /chrome-extension:\\/\\/ URL of different extension/i;
+var FOREIGN_FRAME_BUDGET = 10;
+var FOREIGN_FRAME_WINDOW_MS = 6e4;
+// tabId -> times a foreign frame was removed / times the re-attach cooldown was skipped for it.
+var foreignFrameRecoveries = /* @__PURE__ */ new Map();
+var foreignFrameBypasses = /* @__PURE__ */ new Map();
+var recentTimes = (map, tabId) => (map.get(tabId) ?? []).filter((t) => Date.now() - t < FOREIGN_FRAME_WINDOW_MS);
+function noteForeignFrameRecovery(tabId) {
+	foreignFrameRecoveries.set(tabId, [...recentTimes(foreignFrameRecoveries, tabId), Date.now()]);
+}
+// Inside the 3 s cooldown a tab may re-attach anyway, FOREIGN_FRAME_BUDGET times a minute (each skip spends
+// one; the budget is what stops a detach/attach loop). Not only after a frame was removed: when LastPass
+// drops its frame by itself before the re-attach, nothing is removed, yet it comes back on the next field.
+function takeForeignFrameBypass(tabId) {
+	const used = recentTimes(foreignFrameBypasses, tabId);
+	if (used.length >= FOREIGN_FRAME_BUDGET) return false;
+	foreignFrameBypasses.set(tabId, [...used, Date.now()]);
+	return true;
+}
+chrome.tabs.onRemoved.addListener((tabId) => {
+	foreignFrameRecoveries.delete(tabId);
+	foreignFrameBypasses.delete(tabId);
+});
+// Per connection and tab, whenever the tab must not be (re-)attached any more (detached, given back to the user,
+// moved out of the group, closed by the MCP): the epoch is bumped (an attach in flight stops), a scheduled
+// re-attach is dropped, and attach commands for it are refused until the tab is announced again
+// (attachTab, the only way an existing tab is offered to the MCP; tabs the MCP opens have new ids).
+var attachEpochs = /* @__PURE__ */ new WeakMap();
+var blockedAttaches = /* @__PURE__ */ new WeakMap();
+function attachEpochOf(conn, tabId) {
+	return attachEpochs.get(conn)?.get(tabId) ?? 0;
+}
+function cancelPendingAttach(conn, tabId) {
+	if (tabId === void 0) return;
+	if (!attachEpochs.has(conn)) attachEpochs.set(conn, /* @__PURE__ */ new Map());
+	attachEpochs.get(conn).set(tabId, attachEpochOf(conn, tabId) + 1);
+	conn._pendingReattach?.delete(tabId);
+	if (!blockedAttaches.has(conn)) blockedAttaches.set(conn, /* @__PURE__ */ new Set());
+	blockedAttaches.get(conn).add(tabId);
+}
+function allowAttach(conn, tabId) {
+	blockedAttaches.get(conn)?.delete(tabId);
+}
+// Runs in the tab (this extension's isolated world, every frame it can reach): removes iframe/frame/embed/
+// object elements that load another extension's page. Returns how many it removed.
+function stripForeignExtensionFramesInPage(ownOrigin) {
+	let removed = 0;
+	const shadowOf = (el) => {
+		try {
+			return chrome.dom?.openOrClosedShadowRoot?.(el) ?? el.shadowRoot;
+		} catch {
+			return el.shadowRoot;
+		}
+	};
+	const visit = (root) => {
+		for (const el of root.querySelectorAll("*")) {
+			if (/^(IFRAME|FRAME|EMBED|OBJECT)$/.test(el.tagName)) {
+				const src = String(el.src || el.data || el.getAttribute("src") || el.getAttribute("data") || "");
+				if (/^chrome-extension:\\/\\//i.test(src) && !src.startsWith(ownOrigin)) {
+					// An iframe stays in place, emptied (about:blank) and hidden: removing it from under the other
+					// extension's UI framework (LastPass renders with React) left its code stuck the next time it
+					// showed its menu, and the page stopped running scripts. object/embed can't be emptied: removed.
+					if (el.tagName === "IFRAME" || el.tagName === "FRAME") {
+						el.setAttribute("src", "about:blank");
+						el.style.setProperty("display", "none", "important");
+					} else el.remove();
+					removed++;
+					continue;
+				}
+			}
+			const shadow = shadowOf(el);
+			if (shadow) visit(shadow);
+		}
+	};
+	visit(document);
+	return removed;
+}
+// How many frames were removed, or -1 when the script could not run in the tab at all.
+// injectImmediately + a time limit: by default executeScript waits for every frame to finish loading, and
+// the other extension's frame may still be loading (it hung there on the second field of a form).
+var STRIP_TIMEOUT_MS = 1500;
+async function stripForeignExtensionFrames(tabId) {
+	const run = (allFrames) => Promise.race([
+		chrome.scripting.executeScript({
+			target: { tabId, allFrames },
+			world: "ISOLATED",
+			injectImmediately: true,
+			func: stripForeignExtensionFramesInPage,
+			args: [chrome.runtime.getURL("")]
+		}),
+		new Promise((_, reject) => setTimeout(() => reject(new Error("executeScript timed out")), STRIP_TIMEOUT_MS))
+	]);
+	let results;
+	try {
+		results = await run(true);
+	} catch {
+		try {
+			results = await run(false);
+		} catch (e) {
+			debugLog(\`Could not remove other extensions' frames from tab \${tabId}:\`, e);
+			return -1;
+		}
+	}
+	return (results ?? []).reduce((n, r) => n + (typeof r?.result === "number" ? r.result : 0), 0);
+}
+// chrome.debugger.attach for connection conn; when another extension's frame blocks it: remove those
+// frames and attach again (FOREIGN_FRAME_RETRIES times, with backoff while Chromium tears the frame down).
+// Stops when the tab stops being this connection's to attach (cancelPendingAttach, connection closed),
+// detaching again if that happened while the last attach was running.
+var FOREIGN_FRAME_RETRIES = 3;
+async function attachDebuggerPastForeignFrames(conn, args) {
+	const tabId = args[0]?.tabId;
+	const epoch = attachEpochOf(conn, tabId);
+	const cancelled = () => conn._closed || attachEpochOf(conn, tabId) !== epoch;
+	if (tabId !== void 0 && (conn._closed || blockedAttaches.get(conn)?.has(tabId))) throw new Error("Tab is no longer this session's to attach");
+	let removedTotal = 0;
+	for (let attempt = 0;; attempt++) {
+		let result;
+		try {
+			result = await invokeChromeMethod("chrome.debugger.attach", args);
+		} catch (e) {
+			if (tabId === void 0 || attempt >= FOREIGN_FRAME_RETRIES || !FOREIGN_FRAME_ERROR.test(String(e?.message)) || !chrome.scripting?.executeScript || cancelled()) throw e;
+			const removed = await stripForeignExtensionFrames(tabId);
+			if (removed < 0) throw e;
+			removedTotal += removed;
+			debugLog(\`Tab \${tabId}: removed \${removed} frame(s) of another extension that blocked the debugger\`);
+			if (removed) noteForeignFrameRecovery(tabId);
+			await new Promise((r) => setTimeout(r, 50 + attempt * 150));
+			if (cancelled()) throw e;
+			continue;
+		}
+		if (tabId !== void 0 && cancelled()) {
+			await chrome.debugger.detach({ tabId }).catch(() => {});
+			throw new Error("Tab is no longer this session's to attach");
+		}
+		if (attempt > 0) {
+			logTabEvent({ tabId, url: agentTabUrls.get(tabId), action: "kept", reason: \`another extension's frame blocked the debugger: removed \${removedTotal}, re-attached\` });
+		}
+		return result;
+	}
+}
+//#endregion
+`,
+  ],
+  // 17) Tabs an agent kept for the user (browser_tabs keep) outlive its session. "keep" lived only in
+  //     the MCP server, so when the session ended the orphan grace closed kept tabs with the rest. Claude
+  //     Code chats live for hours, so it rarely showed; a job in Codex (codex exec, one server per job)
+  //     ends right after its answer, and the form it left for the user vanished 3 min later. The server now
+  //     reports kept tabs (playwright.keepTab); every closeAgentTabs path (session gone, group done) leaves
+  //     them open, out of the 🤖 group, as the user's. Closing one on purpose (chrome.tabs.remove) still works.
+  [
+    '\t"playwright.takeTab"\n]);',
+    '\t"playwright.takeTab",\n\t"playwright.keepTab"\n]);',
+  ],
+  [
+    '\t\tif (message.method === "playwright.listTabs") return { tabs: await userOpenTabs() };\n',
+    `\t\tif (message.method === "playwright.listTabs") return { tabs: await userOpenTabs() };
+		if (message.method === "playwright.keepTab") {
+			const { tabId } = args[0] ?? {};
+			if (typeof tabId !== "number" || !this._attachedTabs.has(tabId)) throw new Error("Not one of this session's tabs");
+			await rememberKeptTab(tabId);
+			return { kept: true };
+		}
+`,
+  ],
+  // The tab on the user's screen (or active in its window) is only ungrouped when an orphan expires: a kept one is
+  // released properly too, so it doesn't stay marked as an agent's.
+  [
+    '\tif (keep.length) await ungroupTabs(keep);\n\tawait closeAgentTabs(tabs.filter((t) => !keep.includes(t.id) && !handedBack.includes(t.id)).map((t) => t.id), orphan.reason);\n',
+    '\tconst keptIds = await keptTabIds();\n\tconst plainKeep = keep.filter((id) => !keptIds.has(id));\n\tif (plainKeep.length) await ungroupTabs(plainKeep);\n\tfor (const id of keep.filter((id) => keptIds.has(id))) await releaseKeptTab(id, orphan.reason);\n\tawait closeAgentTabs(tabs.filter((t) => !keep.includes(t.id) && !handedBack.includes(t.id)).map((t) => t.id), orphan.reason);\n',
+  ],
+  [
+    "\t// 14) The user's tabs are given back, never closed.\n\tconst user = await userTabIds();\n",
+    `\t// 17) Tabs an agent kept for the user stay open, out of the agent group.
+	const kept = await keptTabIds();
+	for (const id of tabIds.filter((id) => kept.has(id))) await releaseKeptTab(id, reason);
+	tabIds = tabIds.filter((id) => !kept.has(id));
+	// 14) The user's tabs are given back, never closed.
+	const user = await userTabIds();
+`,
+  ],
+  [
+    "//#region local build: The user's tabs (build-extension.cjs 14)\n",
+    `//#region local build: tabs kept for the user (build-extension.cjs 17)
+// In chrome.storage.local like the user's tabs, so a deploy keeps them; cleared when Brave starts (tab ids restart).
+var KEPT_TABS_KEY = "keptTabs";
+var keptTabMemory = /* @__PURE__ */ new Set();
+var keptTabsLoaded = Promise.resolve(chrome.storage?.local?.get(KEPT_TABS_KEY)).then((stored) => {
+	for (const id of stored?.[KEPT_TABS_KEY] ?? []) keptTabMemory.add(Number(id));
+}, () => {});
+async function keptTabIds() {
+	await keptTabsLoaded;
+	return new Set(keptTabMemory);
+}
+async function saveKeptTabs() {
+	await chrome.storage?.local?.set({ [KEPT_TABS_KEY]: [...keptTabMemory] }).catch(() => {});
+}
+async function rememberKeptTab(tabId) {
+	await keptTabsLoaded;
+	if (keptTabMemory.has(tabId)) return;
+	keptTabMemory.add(tabId);
+	await saveKeptTabs();
+}
+async function forgetKeptTab(tabId) {
+	await keptTabsLoaded;
+	if (keptTabMemory.delete(tabId)) await saveKeptTabs();
+}
+// The agent's session is done with it: the user's now. Out of the 🤖 group, no longer an agent's (or a taken tab of
+// theirs marked as in use), page as it is. The keep mark goes last, so a reload half way still protects it.
+async function inAgentGroup(tab) {
+	return tab.groupId >= 0 && !!(await chrome.tabGroups.get(tab.groupId).catch(() => null))?.title?.startsWith(PLAYWRIGHT_GROUP_TITLE);
+}
+// A live session still working in the tab (it navigated back from a placeholder, a connect-page check ran
+// late): not released, it stays that session's until the session is gone.
+function liveSessionHasTab(tabId) {
+	for (const group of playwrightExtension._connections.values()) if (!group._connection?._closed && (group._groupTabIds?.has(tabId) || group._connection?._attachedTabs?.has(tabId))) return true;
+	return false;
+}
+// Releases that could not finish (the user dragging tabs): retried on the orphan alarm until done or a live
+// session has the tab again.
+var pendingKeptReleases = /* @__PURE__ */ new Map();
+async function releaseKeptTab(tabId, reason) {
+	pendingKeptReleases.delete(tabId);
+	if (liveSessionHasTab(tabId)) return;
+	// Out of the agent group, re-checking before each try that no session took the tab back meanwhile.
+	for (const delay of [0, 100, 200, 400, 800]) {
+		if (delay) await new Promise((r) => setTimeout(r, delay));
+		const tab = await chrome.tabs.get(tabId).catch(() => null);
+		if (!tab || !await inAgentGroup(tab)) break;
+		if (liveSessionHasTab(tabId)) return;
+		await chrome.tabs.ungroup([tabId]).catch(() => {});
+	}
+	const now = await chrome.tabs.get(tabId).catch(() => null);
+	if (now && await inAgentGroup(now)) {
+		if (liveSessionHasTab(tabId)) return;
+		// Keep the protection (the keep mark) and try again later.
+		debugLog("Kept tab " + tabId + ": could not take it out of the agent group yet; retrying later");
+		pendingKeptReleases.set(tabId, reason);
+		return;
+	}
+	const tab = now;
+	if (liveSessionHasTab(tabId)) return;
+	for (const group of playwrightExtension._connections.values()) group.releaseTab(tabId);
+	const ours = await agentTabIds();
+	if (ours.delete(tabId)) await saveAgentTabIds(ours);
+	await forgetUserTab(tabId);
+	await forgetKeptTab(tabId);
+	if (!tab) return;
+	chrome.tabs.update(tabId, { autoDiscardable: true }).catch(() => {});
+	logTabEvent({ tabId, url: tab.url, action: "left open for the user (an agent kept it for them)", reason });
+}
+chrome.tabs.onRemoved.addListener((tabId) => {
+	pendingKeptReleases.delete(tabId);
+	if (keptTabMemory.has(tabId)) void forgetKeptTab(tabId);
+});
+chrome.alarms?.onAlarm.addListener((alarm) => {
+	if (alarm.name !== "playwright-orphans") return;
+	for (const [id, reason] of [...pendingKeptReleases]) void releaseKeptTab(id, reason);
+	for (const [id, reason] of [...pendingUserReleases]) void releaseUserTab(id, reason);
+});
+// Tab ids start over with Brave: wait for the stored list to load, then drop it.
+chrome.runtime.onStartup.addListener(() => {
+	void keptTabsLoaded.then(() => {
+		keptTabMemory.clear();
+		return saveKeptTabs();
+	});
+});
+//#endregion
+//#region local build: The user's tabs (build-extension.cjs 14)
+`,
+  ],
+  [
+    '\t\tif (this._recentReattach.has(tabId)) {\n',
+    '\t\tif (this._recentReattach.has(tabId) && !takeForeignFrameBypass(tabId)) {\n',
+  ],
+  [
+    '\t\tconst result = await invokeChromeMethod(message.method, args);\n',
+    // A detach the MCP sends for a tab that is no longer attached is Playwright tidying up after Chromium cut
+    // the debugger (Target.detachFromTarget): it must not cancel the re-attach that is already scheduled.
+    '\t\tif (message.method === "chrome.debugger.detach" && this._attachedTabs.has(args[0]?.tabId)) cancelPendingAttach(this, args[0]?.tabId);\n\t\tif (message.method === "chrome.tabs.remove") for (const id of [args[0]].flat()) cancelPendingAttach(this, id);\n\t\tconst result = message.method === "chrome.debugger.attach" ? await attachDebuggerPastForeignFrames(this, args) : await invokeChromeMethod(message.method, args);\n',
+  ],
+  [
+    '\tdetachTab(tabId) {\n\t\tif (this._closed || !this._attachedTabs.has(tabId)) return;\n',
+    '\tdetachTab(tabId) {\n\t\tcancelPendingAttach(this, tabId);\n\t\tif (this._closed || !this._attachedTabs.has(tabId)) return;\n',
+  ],
+  [
+    '\tattachTab(tab) {\n\t\tif (this._closed || this._attachedTabs.has(tab.id)) return;\n',
+    '\tattachTab(tab) {\n\t\tif (this._closed || this._attachedTabs.has(tab.id)) return;\n\t\tallowAttach(this, tab.id);\n',
+  ],
+  [
+    '\t\t\tif (this._connection.attachedTabs.has(tabId)) this._connection.detachTab(tabId);\n\t\t\t// The user moved their tab back out of the group: theirs again.\n',
+    '\t\t\tcancelPendingAttach(this._connection, tabId);\n\t\t\tif (this._connection.attachedTabs.has(tabId)) this._connection.detachTab(tabId);\n\t\t\t// The user moved their tab back out of the group: theirs again.\n',
+  ],
+  // 16) Each re-attach starts a 3 s cooldown timer; an older timer must not end a newer cooldown (it let a
+  //     frame that keeps coming back re-attach without limit, past the bypass budget).
+  [
+    '\t\tthis._recentReattach.add(tabId);\n\t\tsetTimeout(() => this._recentReattach.delete(tabId), REATTACH_COOLDOWN_MS);\n',
+    '\t\tthis._recentReattach.add(tabId);\n\t\tconst cooldownToken = {};\n\t\t(this._cooldownTokens ??= /* @__PURE__ */ new Map()).set(tabId, cooldownToken);\n\t\tsetTimeout(() => {\n\t\t\tif (this._cooldownTokens.get(tabId) === cooldownToken) this._recentReattach.delete(tabId);\n\t\t}, REATTACH_COOLDOWN_MS);\n',
+  ],
+  // 18) A finished Codex job's tabs are settled at once. Each
+  //     job in Codex is its own MCP session that never reconnects, yet its leftover tabs waited the
+  //     3 min orphan grace (a kept one stayed hidden in the collapsed group as long). When such a server's
+  //     client is gone for good it sends playwright.sessionDone (apply.cjs SESSION_DONE) just before its
+  //     connection closes; the orphan then expires right away: forgotten tabs close, kept ones are left open
+  //     for the user, their own tabs go back to them. A crash or restart sends nothing and keeps the full grace.
+  [
+    '\t"playwright.takeTab",\n\t"playwright.keepTab"\n]);',
+    '\t"playwright.takeTab",\n\t"playwright.keepTab",\n\t"playwright.sessionDone"\n]);',
+  ],
+  // 18b) Codex kills the job's whole process tree, so the server usually can't send sessionDone. A session whose
+  //      key names its client process ("claude-pid:<pid>": a Codex job's codex.exe, or a chat without a session
+  //      id) is over when that process is gone: the broker checks (GET /alive, broker.cjs) 1.5, 5 and 12 s after
+  //      the disconnect and on every orphan sweep, and the orphan then expires at once. The same check settles
+  //      groups left over at extension start whose session is gone (they waited 15 min). /mcp and restarts keep
+  //      the client process alive, so they keep the grace.
+  [
+    '\torphan.timer = setTimeout(() => void expireOrphan(orphan), grace);\n\torphanSessions.push(orphan);\n',
+    '\torphan.timer = setTimeout(() => void expireOrphan(orphan), grace);\n\torphanSessions.push(orphan);\n\tfor (const ms of [1500, 5e3, 12e3]) setTimeout(() => void expireIfSessionGone(orphan), ms);\n',
+  ],
+  [
+    '\tfor (const o of [...orphanSessions]) if (now - o.at >= o.grace) void expireOrphan(o);\n',
+    `\tfor (const o of [...orphanSessions]) if (now - o.at >= o.grace) void expireOrphan(o);
+	else void expireIfSessionGone(o);
+`,
+  ],
+  [
+    'function sessionKeyFromUrl(url) {\n',
+    `// The client process of a session, when its key names one.
+function sessionPid(key) {
+	// Only "claude-pid:" names the client process itself (Claude Code, or codex.exe for a Codex job); a bare
+	// "pid:<ppid>" may be a supervisor that died while its client lives on, so it keeps the normal grace.
+	const m = /^claude-pid:(\\d+)$/.exec(String(key || ""));
+	return m ? Number(m[1]) : void 0;
+}
+async function sessionProcessGone(key) {
+	const pid = sessionPid(key);
+	if (!pid) return false;
+	try {
+		const res = await fetch("http://127.0.0.1:${BROKER_PORT}/alive?pid=" + pid, { signal: AbortSignal.timeout(2e3) });
+		if (!res.ok) return false;
+		return (await res.json())?.alive === false;
+	} catch {
+		return false;
+	}
+}
+async function expireIfSessionGone(orphan) {
+	if (!orphanSessions.includes(orphan) || !await sessionProcessGone(orphan.sessionKey)) return;
+	if (!orphanSessions.includes(orphan)) return;
+	orphan.reason = "session ended (its client process is gone)";
+	await expireOrphan(orphan);
+}
+function sessionKeyFromUrl(url) {
+`,
+  ],
+  [
+    '\t\tif (message.method === "playwright.keepTab") {\n',
+    '\t\tif (message.method === "playwright.sessionDone") {\n\t\t\tthis._sessionDone = true;\n\t\t\treturn {};\n\t\t}\n\t\tif (message.method === "playwright.keepTab") {\n',
+  ],
+  // The user's own tabs the session worked in (taken over, handed to it) go back to them when it expires, wherever
+  // they are by then: in one of their own groups or on their screen they used to stay marked as in use by an agent.
+  [
+    '\torphanSessions.splice(i, 1);\n\tclearTimeout(orphan.timer);\n\tconst groupIds = new Set(orphan.groups.map((g) => g.groupId));\n',
+    '\torphanSessions.splice(i, 1);\n\tclearTimeout(orphan.timer);\n\tconst userIds = await userTabIds();\n\tconst userOfOrphan = orphan.tabIds.filter((id) => userIds.has(id));\n\tfor (const id of userOfOrphan) if (!liveSessionHasTab(id)) await releaseUserTab(id, orphan.reason);\n\tconst groupIds = new Set(orphan.groups.map((g) => g.groupId));\n',
+  ],
+  // ...and never closed by the rest of the cleanup, even when ungrouping failed (the user dragging tabs).
+  [
+    '\tawait closeAgentTabs(tabs.filter((t) => !keep.includes(t.id) && !handedBack.includes(t.id)).map((t) => t.id), orphan.reason);\n}\n',
+    '\tawait closeAgentTabs(tabs.filter((t) => !keep.includes(t.id) && !handedBack.includes(t.id) && !userOfOrphan.includes(t.id)).map((t) => t.id), orphan.reason);\n}\n',
+  ],
+  [
+    '\t\t\treason: "session disconnected (did not reconnect within 3 min)"\n\t\t});\n\t\tthis.onclose?.();\n',
+    '\t\t\treason: this._connection?._sessionDone ? "session ended (its job finished)" : "session disconnected (did not reconnect within 3 min)",\n\t\t\tgrace: this._connection?._sessionDone ? 0 : ORPHAN_GRACE_MS\n\t\t});\n\t\tthis.onclose?.();\n',
+  ],
+  // 19) Recording a hidden agent tab A background tab gets no compositor frames, so
+  //     Page.startScreencast (browser_start_video) recorded blank frames and screenshots took 1-30 s (each one
+  //     flips the tab visible, then hidden again). Chromium keeps rendering a tab while a capture is in
+  //     flight, so while a screencast runs on a tab, two staggered loops of Page.captureScreenshot calls
+  //     (jpeg quality 1, optimizeForSpeed, whole viewport) always overlap: the tab renders continuously
+  //     (measured in Brave 157: 0 -> ~70 frames/s) without being activated, focused or moved. NO clip: a clipped
+  //     screenshot briefly resizes the view, so the screencast got 2x2 px frames (gray video). No server
+  //     change: the stock browser_start_video / browser_stop_video work on hidden tabs.
+  [
+    'function markAgentTabUse(method, args) {\n\tconst target = args[0];\n',
+    'function markAgentTabUse(method, args) {\n\tconst target = args[0];\n\trecordingHold(method, args);\n',
+  ],
+  [
+    'chrome.alarms?.clear("playwright-idle-tabs");\n//#endregion\n',
+    `chrome.alarms?.clear("playwright-idle-tabs");
+//#endregion
+//#region local build: record hold for hidden tabs (build-extension.cjs 19)
+// Stops on Page.stopScreencast, tab removal or debugger detach, when the MCP has sent the tab nothing for
+// 30 s (it pings every hidden tab every 2 s, and acks every frame), or after 3 h.
+var RECORD_HOLD_IDLE_MS = 30e3;
+var RECORD_HOLD_MAX_MS = 3 * 60 * 60e3;
+var recordHolds = /* @__PURE__ */ new Map();
+function recordingHold(method, args) {
+	const target = args[0];
+	if (method !== "chrome.debugger.sendCommand" || target?.tabId === void 0) return;
+	const hold = recordHolds.get(target.tabId);
+	if (hold) hold.last = Date.now();
+	if (args[1] === "Page.startScreencast") startRecordHold(target.tabId);
+	else if (args[1] === "Page.stopScreencast") stopRecordHold(target.tabId);
+}
+function startRecordHold(tabId) {
+	if (recordHolds.has(tabId)) return;
+	const hold = { since: Date.now(), last: Date.now(), stopped: false };
+	recordHolds.set(tabId, hold);
+	const loop = async (delay) => {
+		await new Promise((r) => setTimeout(r, delay));
+		let fails = 0;
+		while (!hold.stopped) {
+			if (Date.now() - hold.last > RECORD_HOLD_IDLE_MS || Date.now() - hold.since > RECORD_HOLD_MAX_MS) {
+				stopRecordHold(tabId, hold);
+				break;
+			}
+			try {
+				await chrome.debugger.sendCommand({ tabId }, "Page.captureScreenshot", { format: "jpeg", quality: 1, optimizeForSpeed: true });
+				fails = 0;
+			} catch {
+				if (++fails > 20) {
+					stopRecordHold(tabId, hold);
+					break;
+				}
+				await new Promise((r) => setTimeout(r, 250));
+			}
+		}
+	};
+	loop(0);
+	loop(40);
+}
+function stopRecordHold(tabId, hold) {
+	const current = recordHolds.get(tabId);
+	if (!current || hold && current !== hold) return;
+	current.stopped = true;
+	recordHolds.delete(tabId);
+}
+chrome.debugger.onDetach.addListener((source) => {
+	if (source.tabId !== void 0) stopRecordHold(source.tabId);
+});
+chrome.tabs.onRemoved.addListener((tabId) => stopRecordHold(tabId));
+//#endregion
 `,
   ],
 ]);

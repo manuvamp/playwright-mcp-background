@@ -279,6 +279,30 @@ try {
     expect(/\\?"target\\?":\\?"string\\?"/.test(r.text) && /\\?"guid\\?":true/.test(r.text), `internals changed: ${r.text.slice(0, 300)}`);
   });
 
+  // Codex: no lane files; each call carries _meta["x-codex-turn-metadata"].thread_id.
+  const codexCall = async (thread, parent, name, args = {}) => {
+    const meta = { callId: `exec-lanetest-${++callNo}`, 'x-codex-turn-metadata': { session_id: parent || thread, thread_id: thread, ...(parent ? { parent_thread_id: parent, agent_role: 'worker', subagent_kind: 'thread_spawn' } : {}) } };
+    const r = await rpc('tools/call', { name, arguments: args, _meta: meta });
+    return { text: (r.result?.content ?? []).filter((c) => c.type === 'text').map((c) => c.text).join('\n') };
+  };
+  await scenario('Codex sub-agents each get their own lane at the same time; the top Codex thread is main', async (expect) => {
+    const P = '00000000-0000-4000-8000-0000000000a0', T1 = '00000000-0000-4000-8000-0000000000a1', T2 = '00000000-0000-4000-8000-0000000000a2';
+    const main = await call('main', 'browser_navigate', { url: SITE + '/c' });
+    expect(pageUrl(main.text) === SITE + '/c', `main on ${pageUrl(main.text)}`);
+    const [r1, r2] = await Promise.all([codexCall(T1, P, 'browser_tabs', { action: 'new', url: SITE + '/a' }), codexCall(T2, P, 'browser_tabs', { action: 'new', url: SITE + '/b' })]);
+    expect(!/error/i.test(r1.text.slice(0, 200)) && !/error/i.test(r2.text.slice(0, 200)), `new tab failed: ${r1.text.slice(0, 200)} | ${r2.text.slice(0, 200)}`);
+    const [s1, s2] = await Promise.all([codexCall(T1, P, 'browser_snapshot'), codexCall(T2, P, 'browser_snapshot')]);
+    expect(/Page A/.test(s1.text) && !/Page B/.test(s1.text), `codex worker 1 is not on page A: ${s1.text.slice(0, 200)}`);
+    expect(/Page B/.test(s2.text) && !/Page A/.test(s2.text), `codex worker 2 is not on page B: ${s2.text.slice(0, 200)}`);
+    const [l1] = await Promise.all([codexCall(T1, P, 'browser_tabs', { action: 'list' })]);
+    expect(tabLines(l1.text).length === 1, `codex worker 1 sees ${tabLines(l1.text).length} tabs, expected only its own`);
+    const top = await codexCall(P, null, 'browser_snapshot');
+    expect(/Page C/.test(top.text), 'the top Codex thread did not run in the main lane');
+    await Promise.all([codexCall(T1, P, 'browser_close'), codexCall(T2, P, 'browser_close')]);
+    const again = await call('main', 'browser_snapshot');
+    expect(/Page C/.test(again.text), 'closing the Codex workers moved or closed the main tab');
+  });
+
   await scenario('lane files are consumed', async (expect) => {
     const left = fs.existsSync(LANE_DIR) ? fs.readdirSync(LANE_DIR).filter((f) => f.includes(`lanetest_${process.pid}_`)) : [];
     expect(!left.length, `${left.length} lane files left`);

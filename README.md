@@ -32,7 +32,26 @@ This repo is a set of string-replacement patches for the installed `playwright-c
 - File upload fixes: the file is read in Node and injected via `DataTransfer`. Works for single/multiple files, hidden inputs, iframes, shadow DOM, unicode names and folders (`webkitdirectory`).
 - New tool `browser_set_input_files`: sets files on an `<input type=file>` directly (snapshot ref or selector), no click or file chooser needed.
 - No "Playwright Extension started debugging this browser" bar, when the browser runs with `--silent-debugger-extension-api` (see "Hide the debugging bar" below). The MCP adds the flag itself when it has to launch the browser.
+- Codex works too: a Codex session's top-level thread is the `main` lane and each sub-agent thread gets its own lane, so parallel Codex workers never share a tab. Codex needs no hook (see "Lanes: parallel agents").
+- Tabs an agent kept for you (`browser_tabs keep`) outlive its session: the extension is told, so the tab stays open, out of the agent group, even after the session ends. If the extension does not confirm the keep, the agent is told so and the tab is not protected.
+- A finished Codex job settles its tabs at once instead of after the grace period: its leftover tabs close, kept tabs stay open, and your own tabs go back to you.
+- Other extensions' frames no longer cost the agent its tab: password managers such as LastPass add an in-field iframe after text is typed into a form field, which makes Chromium cut the extension's debugger and the agent loses the tab. The extension now empties and hides that frame and re-attaches, and the server waits for the tab to come back instead of opening a blank one.
+- Recording works in hidden tabs: `browser_start_video` on a background tab no longer records blank frames (see "Recording a hidden tab").
+- Argument aliases for models that guess: `ref` / `startRef` / `endRef` are accepted for `target` / `startTarget` / `endTarget`, and `script`, `expression`, `code`, `js` or `fn` for the code argument of `browser_evaluate` and `browser_run_code_unsafe`.
+- `take-download.cjs` moves a file an agent just downloaded out of your Downloads folder into `AI Downloads` (see "Downloads").
 - Optional: the tab group title can be the title of the T3 Code thread running the agent (see "Group name" below).
+
+## What's new in 1.2.0
+
+- Codex lanes: calls carry `_meta["x-codex-turn-metadata"]` with a thread id; sub-agent threads get their own lane (`cx<end of thread id>`), and a sub-agent lane idle for 10 minutes is finished like a Claude subagent (its tabs close, `keep` tabs are handed back). Patches `LANES_CODEX` and `LANES_CODEX_IDLE` in `apply.cjs`.
+- `keep` survives the session (`playwright.keepTab`, build-extension 17), and a finished Codex job settles its tabs immediately (`playwright.sessionDone`, build-extension 18). `broker.cjs` has a new `GET /alive?pid=<pid>` that the extension asks about a session's client process (a Codex job is killed with its whole process tree, so the server often cannot say goodbye itself).
+- `mcp-supervisor.cjs` starts the MCP server detached and, when its client goes away, closes the child's stdin and gives it up to 3 s to say goodbye to the extension before it kills it. On Windows a non-detached child was killed at once together with the supervisor.
+- Other extensions' frames (build-extension 16, patch `LOST_TAB_WAIT`): removed from the tab and the debugger re-attached, with a re-attach budget per tab; the server waits up to 3 s for a lost tab (and says "Your tab is back" when a failed call ran into it).
+- Hidden-tab recording (build-extension 19).
+- `ref` and code-argument aliases (`REF_ALIAS`, `CODE_ARG_ALIAS`).
+- `apply.cjs` refuses to write a bundle that does not parse, so a bad patch cannot stop every new browser session.
+- New files: `take-download.cjs`, `patches/live-typing.mjs`, `patches/codex-smoke.mjs`. New tests: a Codex scenario in `test-lanes.mjs` (18 scenarios) and recording scenarios in `sim-tabs.cjs` (65 scenarios).
+- No new settings. `PW_MCP_DOWNLOADS` only affects `take-download.cjs`.
 
 ## Requirements
 
@@ -75,7 +94,7 @@ This repo is a set of string-replacement patches for the installed `playwright-c
    node broker.cjs
    ```
 
-   Check it: `curl 127.0.0.1:8770/status` should return `{"extension":true,...}`. On Windows, copy `scripts/playwright-broker.vbs` to your Startup folder (after editing the broker path in it, or setting `PW_MCP_BROKER`) to start the broker hidden at logon. The patched MCP server also starts the broker on demand.
+   Check it: `curl 127.0.0.1:8770/status` should return `{"extension":true,...}` (`/alive?pid=<pid>` answers whether a process is still running, see "Tabs and the end of a session"). On Windows, copy `scripts/playwright-broker.vbs` to your Startup folder (after editing the broker path in it, or setting `PW_MCP_BROKER`) to start the broker hidden at logon. The patched MCP server also starts the broker on demand.
 
 6. Configure your MCP client. Example for Claude Code (`~/.claude.json`, or use `claude mcp add`); use absolute paths:
 
@@ -132,7 +151,33 @@ Register it in your Claude Code settings (`hooks` in `~/.claude/settings.json` o
 
 The lane dir is `PW_LANE_DIR` if set, otherwise `<repo>/lane-ids` for both the hook (it resolves the path from its own location, so it must stay inside the repo) and the patched server. If you copy the hook elsewhere or run the server from another folder, set `PW_LANE_DIR` for both: in the hook's environment, and in the MCP server entry's `env`. Set `PW_MCP_SERVER_NAME` for the hook if you want it to ignore tools of other MCP servers (the matcher already does this). Offline test: `node claude-code-hooks/browser-lanes/test/run-tests.js`.
 
+Codex needs no hook. Codex sends no tool-use id, but every call carries `_meta["x-codex-turn-metadata"]` with its `thread_id` (and `parent_thread_id` for a spawned sub-agent). A session's top-level thread keeps the `main` lane, and each sub-agent thread gets a lane named `cx<end of its thread id>`, so parallel Codex workers each have their own current tab. Codex has no reliable SubagentStop hook, so a sub-agent lane that makes no call for 10 minutes is finished the way a Claude subagent is: its tabs close and `keep` tabs are handed back. Each Codex job is its own MCP server; when it ends, its tabs are settled right away (see "Tabs and the end of a session").
+
 Other MCP clients that do not send a tool-use id and have no hook simply run everything in the `main` lane.
+
+## Tabs and the end of a session
+
+- `browser_tabs keep` marks a tab you must act on (a form to finish, a sign-in). The MCP server tells the extension (`playwright.keepTab`), which remembers it in `chrome.storage.local`: the tab stays open, out of the agent group, when the session ends, also for a Codex job that ends right after its answer. If the extension did not confirm, the tool says the tab is only kept while the session runs, and the agent should tell you.
+- A Codex job never reconnects once it ends. When its server sees its client go away it sends `playwright.sessionDone`, and the extension settles the session's tabs at once: forgotten tabs close, kept tabs stay open, tabs of yours it worked in go back to you. When Codex kills the whole process tree instead, the extension asks the broker (`GET /alive?pid=<pid>`, for sessions keyed `claude-pid:<pid>`) 1.5, 5 and 12 seconds later and on every orphan sweep, and settles the session as soon as its client process is gone. A crash or restart of the MCP server sends nothing and keeps the normal grace period, as does `/mcp` in Claude Code.
+- `mcp-supervisor.cjs` starts the server detached and, when its client closes the pipe, closes the child's stdin and waits up to 3 seconds for it to finish before killing it.
+
+## Other extensions' frames
+
+Chromium never lets one extension's debugger stay attached to a page that holds another extension's frame. Password managers (LastPass is the one measured) mount an in-field menu iframe shortly after text is typed into a form field; the debugger detaches, the re-attach fails with `Cannot access a chrome-extension:// URL of different extension`, and the agent sees "No open tabs" while the tab sits in its group. When attaching fails for that reason the extension empties and hides every frame of another extension in the tab (closed shadow roots included) and attaches again. A tab recovered this way may re-attach 10 times a minute inside the usual 3-second re-attach cooldown. On the server side, an agent's next call waits up to 3 seconds for a tab that went away without the agent closing it, and a call that failed on it gets the note "Your tab is back ... take browser_snapshot, check whether this call's effect happened, and retry only this call if it did not".
+
+## Recording a hidden tab
+
+A background tab gets no compositor frames, so `browser_start_video` on it used to record blank frames and screenshots took 1 to 30 seconds. While a screencast runs on an agent tab, the extension keeps two staggered loops of tiny `Page.captureScreenshot` calls (whole viewport, no clip, jpeg quality 1) running, so Chromium keeps rendering the tab without activating, focusing or moving it. The hold ends on `Page.stopScreencast`, when the tab closes or the debugger detaches, when the MCP has sent the tab nothing for 30 seconds, or after 3 hours. The stock `browser_start_video` / `browser_stop_video` tools work as they are.
+
+## Downloads
+
+A browser that saves downloads without asking puts agent downloads next to your own. After an agent downloads a file, it runs:
+
+```
+node take-download.cjs --match "*.pdf" --to "<job name>"
+```
+
+which waits for the download to finish and moves the newest match from your Downloads folder into `Downloads/AI Downloads/<job name>/`. `--match` takes part of the file name or a glob (always pass it, so a download of yours from the same minute is not taken). `--since` (default: the last 120 seconds), `--wait`, `--all` and `--list` (show what would be moved) are optional. It prints JSON and exits 1 when nothing matched. `PW_MCP_DOWNLOADS` sets the folder the browser saves to (default: `<home>/Downloads`).
 
 ## Install layout and versioned installs
 
@@ -178,20 +223,21 @@ After any `npm install` / update of `@playwright/mcp`, run `node patches/apply.c
 | Variable | Used by | Default | Purpose |
 |---|---|---|---|
 | `PLAYWRIGHT_MCP_EXTENSION_TOKEN` | MCP server, `build-extension.cjs` | none | Extension auth token. `build-extension.cjs` falls back to `~/.claude.json` `mcpServers.<name>.env`. |
-| `PW_MCP_SERVER_NAME` | `use-supervisor`, `build-extension`, `test-supervisor`, `live-lanes`, `deploy-extension`, `bridge`, `smoke`, the lanes hook (optional) | `brave` | Name of the MCP server entry in `~/.claude.json` (also the `mcp__<name>__` tool prefix). |
+| `PW_MCP_SERVER_NAME` | `use-supervisor`, `build-extension`, `test-supervisor`, `live-lanes`, `live-typing`, `codex-smoke`, `deploy-extension`, `bridge`, `smoke`, the lanes hook (optional) | `brave` | Name of the MCP server entry in `~/.claude.json` (also the `mcp__<name>__` tool prefix). |
 | `PW_MCP_BROKER_PORT` | broker, patched server, extension build, smoke | `8770` | Broker port. Rebuild the extension if you change it. |
 | `PW_MCP_BROWSER_PROCESS` | broker, patched server, smoke | `brave.exe` | Browser process image name, used to tell whether the browser is running (Windows `tasklist`). |
 | `PW_MCP_BROKER_LAUNCHER` | patched server | `Startup\playwright-broker.vbs` if present, else `node broker.cjs` | Script that starts the broker detached. |
-| `PW_MCP_BROWSER_USER_DATA` | `build-extension` | Brave's `User Data` dir under `%LOCALAPPDATA%` | Browser user data dir to find the store copy of the extension. |
-| `PW_MCP_PROFILE` | `build-extension` | `Default` | Browser profile directory name. |
+| `PW_MCP_BROWSER_USER_DATA` | `build-extension`, `codex-smoke` | Brave's `User Data` dir under `%LOCALAPPDATA%` | Browser user data dir to find the store copy of the extension. |
+| `PW_MCP_PROFILE` | `build-extension`, `codex-smoke` | `Default` | Browser profile directory name. |
 | `PW_MCP_EXTENSION_OUT` | `build-extension` | `./extension-bg` | Output directory (same as `--out`). |
 | `PW_MCP_TOOL_CAP_MS` | patched server | `120000` | Per-tool-call time cap. |
-| `PW_LANE_DIR` | patched server, `claude-code-hooks/browser-lanes/hook.js`, `deploy-extension`, `test-lanes`, `live-lanes` | `<repo>/lane-ids` | Folder where the hook writes per-call lane files and subagent-done notices. Must be the same for the hook and the server. |
+| `PW_LANE_DIR` | patched server, `claude-code-hooks/browser-lanes/hook.js`, `deploy-extension`, `test-lanes`, `live-lanes`, `live-typing` | `<repo>/lane-ids` | Folder where the hook writes per-call lane files and subagent-done notices. Must be the same for the hook and the server. |
 | `QUIET_MIN` | `deploy-extension` | `10` | Minutes without a browser call before a deploy goes ahead. |
 | `SIM_EXT_DIR` | `sim-tabs` | `./extension-bg` | Extension build directory to test (or pass it as the first argument). |
 | `PW_TEST_CHROME`, `PLAYWRIGHT_BROWSERS_PATH` | `test-lanes` | newest `ms-playwright` chrome-headless-shell | Headless browser for the offline lanes test. |
 | `PLAYWRIGHT_MCP_GROUP_NAME` | patched server | thread title or project folder | Overrides the tab group title for this connection. |
 | `PW_MCP_NODE`, `PW_MCP_BROKER` | `scripts/playwright-broker.vbs` | `C:\Program Files\nodejs\node.exe`, placeholder path | Paths used by the launcher. |
+| `PW_MCP_DOWNLOADS` | `take-download.cjs` | `<home>/Downloads` | Folder the browser saves downloads to. |
 | `BRIDGE_PORT` | `bridge.mjs` | `8765` | Port of the test bridge. |
 
 ### Group name
@@ -224,11 +270,13 @@ Behaviour to know about: in agent tabs `document.visibilityState` is normally `"
 ## Testing
 
 - `node patches/smoke.mjs [--only name1,name2] [--skip-disruptive]`: 13 end-to-end scenarios against the real browser in background tabs (connect, uploads, input events, dialogs, popups, hung page, reload, broker restart). It samples the foreground window every 250 ms and fails if a browser window takes focus (any browser window, if the browser wasn't in front when the run started). The popups scenario opens a real popup window, which the browser shows in front as it is created, so don't run it while you're using the machine. It uses `bridge.mjs` and your configured MCP server entry. The "disruptive" cases briefly disconnect every agent session on the machine, so use `--skip-disruptive` when others are using the browser.
-- `node patches/test-supervisor.cjs [--server <name>]`: exercises `mcp-supervisor.cjs` (handshake, child killed idle, child killed mid-call, code update while idle, clean exit).
-- `node patches/sim-tabs.cjs [extension-dir]`: replays tab scenarios (you vs. agent opening tabs, popups, popup windows, agents closing the tab you're viewing, lane sub-groups, orphaned sessions, handing your tabs over) against the built extension in a simulated Chromium, with nothing on screen. Fails if the extension ever focuses a window. `SIM_DISABLE_FIX=1` restores the old "every tab opened from an agent tab is the agent's" behaviour, so you can see the scenarios catch it.
-- `node patches/test-lanes.mjs [install-dir]`: offline test of the lanes patches against a headless Chromium on a throwaway profile (two agents navigating at the same time, per-agent tab lists, popups, `keep`, subagent-finished cleanup, errors without the extension). Never touches your real browser.
+- `node patches/test-supervisor.cjs [--server <name>]`: runs against your configured MCP server entry (your real browser when that entry uses `--extension`) and exercises `mcp-supervisor.cjs` (handshake, child killed idle, child killed mid-call, code update while idle, clean exit).
+- `node patches/sim-tabs.cjs [extension-dir]`: replays tab scenarios (you vs. agent opening tabs, popups, popup windows, agents closing the tab you're viewing, lane sub-groups, orphaned sessions, handing your tabs over, recording a hidden tab) against the built extension in a simulated Chromium, with nothing on screen. Fails if the extension ever focuses a window. `SIM_DISABLE_FIX=1` restores the old "every tab opened from an agent tab is the agent's" behaviour, so you can see the scenarios catch it.
+- `node patches/test-lanes.mjs [install-dir]`: offline test of the lanes patches against a headless Chromium on a throwaway profile (two agents navigating at the same time, per-agent tab lists, popups, `keep`, subagent-finished cleanup, Codex sub-agent lanes, errors without the extension). Never touches your real browser.
 - `node claude-code-hooks/browser-lanes/test/run-tests.js`: offline tests of the lanes hook.
 - `node patches/live-lanes.mjs [install-dir]`: the same ideas against your real browser through the loaded extension (background tabs only, no extension reload). `deploy-extension.cjs` runs it after a reload.
+- `node patches/live-typing.mjs [install-dir] [type|fill|click|none] [lane] [watchSeconds]`: real browser, background tab: types into a form (`https://httpbin.org/forms/post`) and watches whether the tab survives. Meaningful with a password manager that injects an in-field frame (see "Other extensions' frames"). `SECOND=1` types a second field right after the first recovery. It writes `server-stderr-*.log` into the folder you run it from.
+- `node patches/codex-smoke.mjs <test> [install-dir]`: real browser, the way Codex drives the server (`_meta["x-codex-turn-metadata"]`, one server per job, jobs ending by closed stdin or a kill). Tests: `type`, `lanes` (3 sub-agents in one job), `jobs` (3 jobs at once), `keep` (a kept tab outlives a crashed job, about 4 minutes), `done` (job end settles tabs at once), `ref` (old `ref` argument name), `all`.
 - `node patches/smoke-extension.mjs`: loads the built `extension-bg/lib/background.mjs` against a mocked `chrome` API to catch startup errors without touching the browser.
 
 Run them after any patch, Playwright update or extension rebuild.
