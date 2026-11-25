@@ -3,6 +3,8 @@
 // their connect-page URL to http://127.0.0.1:8770/open and the extension opens it in a minimized
 // agent tab, so connecting never launches the browser exe (which always brings the browser to the front).
 // Can be started at logon by scripts/playwright-broker.vbs (Windows); MCP servers also start it on demand.
+// Also answers GET /alive?pid=<pid> (is that process still running), which the extension uses to settle the tabs of
+// a finished agent session at once.
 // Env: PW_MCP_BROKER_PORT (default 8770), PW_MCP_BROWSER_PROCESS (browser image name, default brave.exe).
 const fs = require('fs');
 const http = require('http');
@@ -61,6 +63,22 @@ const server = http.createServer(async (req, res) => {
     extension.send(JSON.stringify({ type: 'reload' }));
     log('asked extension to reload');
     res.end('reloading');
+    return;
+  }
+  // Is a process still running? The extension asks about the process an agent session belongs to (its
+  // sessionKey "claude-pid:<pid>"): when a Codex job or a chat has ended, its tabs need no reconnect grace
+  // (build-extension.cjs 18). Answered from here because Codex kills its MCP servers with the job.
+  if (req.method === 'GET' && req.url.startsWith('/alive?')) {
+    const pid = Number(new URL(req.url, 'http://127.0.0.1').searchParams.get('pid'));
+    if (!Number.isInteger(pid) || pid <= 0) {
+      res.statusCode = 400;
+      res.end('pid?');
+      return;
+    }
+    let alive;
+    try { process.kill(pid, 0); alive = true; } catch (e) { alive = e.code === 'EPERM'; }
+    res.setHeader('content-type', 'application/json');
+    res.end(JSON.stringify({ pid, alive }));
     return;
   }
   if (req.method !== 'POST' || req.url !== '/open') {

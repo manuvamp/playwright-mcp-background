@@ -1,6 +1,6 @@
 {
   "name": "playwright-mcp-background",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Patches that make Playwright MCP (extension mode) drive your real, logged-in Chromium browser entirely in the background: background tabs, parallel per-agent tab lanes, no focus stealing, hung-tab recovery, and file upload fixes.",
   "license": "Apache-2.0",
   "type": "commonjs",
@@ -13,7 +13,10 @@
     "sim-tabs": "node patches/sim-tabs.cjs",
     "test-lanes": "node patches/test-lanes.mjs",
     "test-hook": "node claude-code-hooks/browser-lanes/test/run-tests.js",
-    "deploy-extension": "node patches/deploy-extension.cjs"
+    "deploy-extension": "node patches/deploy-extension.cjs",
+    "live-typing": "node patches/live-typing.mjs",
+    "codex-smoke": "node patches/codex-smoke.mjs",
+    "take-download": "node take-download.cjs"
   },
   "dependencies": {
     "@playwright/mcp": "0.0.83"

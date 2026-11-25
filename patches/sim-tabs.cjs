@@ -1048,6 +1048,72 @@ const keepAlive = setInterval(() => {}, 1000);
     expect(s.b.tab(r.result.id).groupId === s.b.tab(s.A1).groupId, 'not grouped');
   });
 
+  // Recording a hidden agent tab (build-extension 19): while Page.startScreencast runs on a background tab the
+  // extension keeps overlapping cheap captureScreenshot calls so Chromium renders it; never activates anything.
+  const recSim = (s) => {
+    const rec = { cmds: [], inflight: 0, maxInflight: 0, shots: 0, fail: false };
+    s.b.chrome.debugger.sendCommand = async (target, method, params) => {
+      rec.cmds.push(method);
+      if (method === 'Page.captureScreenshot') {
+        if (rec.fail) throw new Error('Debugger is not attached to the tab with id: ' + target.tabId);
+        rec.shots++;
+        rec.inflight++; rec.maxInflight = Math.max(rec.maxInflight, rec.inflight);
+        await sleep(20);
+        rec.inflight--;
+        if (params?.clip) rec.clipped = true; // a clip resizes the view: the screencast would get tiny frames
+      }
+      return {};
+    };
+    return rec;
+  };
+  await scenario('recording a hidden tab: Page.startScreencast keeps overlapping tiny screenshots running, stop ends them, nothing is activated', async (s, expect) => {
+    const rec = recSim(s);
+    await s.mcp('chrome.debugger.sendCommand', [{ tabId: s.A2 }, 'Page.startScreencast', { format: 'jpeg' }]);
+    await sleep(300);
+    expect(rec.shots >= 8, `only ${rec.shots} hold screenshots in 300 ms`);
+    expect(rec.maxInflight >= 2, `screenshots never overlapped (max in flight ${rec.maxInflight})`);
+    expect(!rec.clipped, 'a hold screenshot used a clip (it resizes the view and ruins the screencast frames)');
+    expect(s.active() === s.U1, `active tab changed to ${s.active()}`);
+    expect(!rec.cmds.some((m) => /bringToFront|activateTarget/.test(m)), 'activation command sent');
+    await s.mcp('chrome.debugger.sendCommand', [{ tabId: s.A2 }, 'Page.stopScreencast', {}]);
+    await sleep(100);
+    const n = rec.shots;
+    await sleep(150);
+    expect(rec.shots === n, 'screenshots continued after Page.stopScreencast');
+    expect(s.ctx.recordHolds.size === 0, 'hold not released');
+  });
+  await scenario('recording a hidden tab: a second start does not double the loops; closing the tab ends the hold', async (s, expect) => {
+    const rec = recSim(s);
+    await s.mcp('chrome.debugger.sendCommand', [{ tabId: s.A2 }, 'Page.startScreencast', {}]);
+    await s.mcp('chrome.debugger.sendCommand', [{ tabId: s.A2 }, 'Page.startScreencast', {}]);
+    await sleep(200);
+    expect(rec.maxInflight === 2, `expected exactly 2 loops, max in flight ${rec.maxInflight}`);
+    await s.mcp('chrome.tabs.remove', [s.A2]);
+    await sleep(100);
+    const n = rec.shots;
+    await sleep(150);
+    expect(rec.shots === n && s.ctx.recordHolds.size === 0, 'hold survived the tab closing');
+  });
+  await scenario('recording a hidden tab: hold ends when the debugger detaches, fails 20 times, or the MCP goes silent', async (s, expect) => {
+    const rec = recSim(s);
+    await s.mcp('chrome.debugger.sendCommand', [{ tabId: s.A2 }, 'Page.startScreencast', {}]);
+    await sleep(100);
+    s.b.chrome.debugger.onDetach.emit({ tabId: s.A2 }, 'target_closed');
+    await sleep(100);
+    expect(s.ctx.recordHolds.size === 0, 'hold survived onDetach');
+    rec.fail = true;
+    await s.mcp('chrome.debugger.sendCommand', [{ tabId: s.A2 }, 'Page.startScreencast', {}]);
+    await sleep(6500);
+    expect(s.ctx.recordHolds.size === 0, 'hold survived 20 failures');
+    rec.fail = false;
+    s.ctx.RECORD_HOLD_IDLE_MS = 400;
+    await s.mcp('chrome.debugger.sendCommand', [{ tabId: s.A2 }, 'Page.startScreencast', {}]);
+    for (let i = 0; i < 4; i++) { await sleep(150); await s.mcp('chrome.debugger.sendCommand', [{ tabId: s.A2 }, 'Page.screencastFrameAck', {}]); }
+    expect(s.ctx.recordHolds.size === 1, 'hold ended while the MCP was still talking to the tab');
+    await sleep(900);
+    expect(s.ctx.recordHolds.size === 0, 'hold survived the MCP going silent');
+  });
+
   const failed = results.filter((r) => r.failures.length);
   console.log(`\n${results.length - failed.length}/${results.length} passed`);
   clearInterval(keepAlive);

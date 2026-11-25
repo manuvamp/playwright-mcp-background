@@ -36,7 +36,11 @@ const toChild = (msg) => child?.stdin.write(JSON.stringify(msg) + '\n');
 function startChild() {
   ready = !initRequest; // before the client's first initialize, pass everything straight through
   // PW_MCP_PARENT_PID: the Claude Code process, so the child can name its tab group (patches/apply.cjs GROUP_NAME).
-  child = spawn(process.execPath, [childScript, ...childArgs], { stdio: ['pipe', 'pipe', 'inherit'], windowsHide: true, env: { ...process.env, PW_MCP_PARENT_PID: String(process.ppid) } });
+  // detached: on Windows libuv puts non-detached children in a kill-on-close job, so a client that kills this
+  // supervisor (Codex ending a job) killed the server at once, before it could tell the extension the session
+  // is over (apply.cjs SESSION_DONE). Detached, it sees its stdin close and exits by itself (Playwright caps
+  // that at 15 s); a normal stop still ends its stdin first (see the stdin "end" handler below).
+  child = spawn(process.execPath, [childScript, ...childArgs], { stdio: ['pipe', 'pipe', 'inherit'], windowsHide: true, detached: true, env: { ...process.env, PW_MCP_PARENT_PID: String(process.ppid) } });
   childBuf = '';
   const me = child;
   child.stdout.on('data', (d) => {
@@ -120,7 +124,16 @@ process.stdin.on('data', (d) => {
     sendToChild(msg);
   }
 });
-process.stdin.on('end', () => { exiting = true; child?.kill(); process.exit(0); });
+// The client is gone: close the child's stdin and let it exit by itself for up to 3 s (it tells the extension
+// the session is over, apply.cjs SESSION_DONE), then kill it.
+process.stdin.on('end', () => {
+  exiting = true;
+  if (!child) process.exit(0);
+  const done = () => process.exit(0);
+  child.once('exit', done);
+  setTimeout(() => { child?.kill(); done(); }, 3000).unref?.();
+  try { child.stdin.end(); } catch { child.kill(); done(); }
+});
 for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => { exiting = true; child?.kill(); process.exit(0); });
 
 // Pick up patched code: restart the child once it is idle.

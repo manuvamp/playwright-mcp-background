@@ -361,7 +361,31 @@ function installLanes(Context, Tab) {
       const rest = this._tabs.filter((t) => t._lane === name);
       const before = this._tabs.slice(0, index).filter((t) => t._lane === name).length;
       lane.current = rest[Math.min(before, rest.length - 1)];
+      // Not closed by the agent: usually the debugger was cut (another extension's frame, build-extension.cjs
+      // 16) and the extension hands the tab back within a second (waitForLostTab).
+      if (!tab._closedByAgent) {
+        lane.lostAt = Date.now();
+        lane.lostTarget = targetIdOf(tab.page);
+      }
     }
+  };
+  // The agent's current tab went away without the agent closing it (in the last 6 s). Before a call
+  // (sameTab false): while the lane has no tab at all, wait up to `ms` for it to come back instead of opening
+  // a blank tab (which would become the agent's tab and leave the returning one, with what it typed, aside).
+  // After a call that failed on it (sameTab true): wait up to `ms` for that very tab (same target id).
+  // Returns true only when the lost tab itself is the lane's current tab again.
+  proto.waitForLostTab = async function(name, ms = 3e3, sameTab = false) {
+    const lane = this.__lanes?.get(name);
+    if (!lane || !lane.lostAt || Date.now() - lane.lostAt > 6e3)
+      return false;
+    const back = () => !!lane.current && lane.lostTarget !== void 0 && targetIdOf(lane.current.page) === lane.lostTarget;
+    const end = Date.now() + ms;
+    while (!back() && Date.now() < end && (sameTab || !lane.current))
+      await new Promise((r) => setTimeout(r, 100));
+    const ok = back();
+    if (ok || Date.now() >= end)
+      lane.lostAt = void 0;
+    return ok;
   };
   proto.newTab = async function() {
     const name = laneNow();
@@ -419,6 +443,7 @@ function installLanes(Context, Tab) {
     if (!tab)
       throw new Error("Tab " + index + " not found");
     const url = tab.page.url();
+    tab._closedByAgent = true;
     await tab.page.close();
     return url;
   };
@@ -464,6 +489,13 @@ function installLanes(Context, Tab) {
     const targetId = targetIdOf(tab.page);
     if (targetId !== void 0)
       keepTargets.add(targetId);
+    // Tell the extension too (build-extension.cjs 17), so the tab stays open for the user after this server is
+    // gone: a Codex job ends right after its answer. Older extension builds don't know the method.
+    const model = globalThis.__pwRelayModel;
+    const tabId = model?.chromeTabIdForTarget?.(targetId);
+    if (tabId !== void 0)
+      return model._sendToExtension("playwright.keepTab", [{ tabId }]).then(() => true, () => false);
+    return Promise.resolve(false);
   };
   // A subagent finished (SubagentStop, via the browser-lanes hook): its tabs close, except the ones it
   // kept for the user; those go to the main agent's list (never as its current tab, so nothing navigates
@@ -599,8 +631,11 @@ function tabsToolSpec(z) {
           const tab = params.index === void 0 ? context.currentTabOrDie() : context.tabs()[params.index];
           if (!tab)
             throw new Error("Tab " + params.index + " not found");
-          context.keepTab(tab);
-          response.addTextResult("This tab stays open for the user after you finish; tell them in your reply what they need to do there. Your other tabs close when you finish.");
+          const lasting = await context.keepTab(tab);
+          if (lasting)
+            response.addTextResult("This tab stays open for the user after you finish, even after your session ends; tell them in your reply what they need to do there. Your other tabs close when you finish.");
+          else
+            response.addTextResult("This tab stays open for the user only while your session runs. Warning: the browser extension did not confirm the keep, so about 3 minutes after your session ends the tab closes with the rest. Tell the orchestrator in your reply that the tab was not kept, which tab it is and what the user still has to do there.");
           break;
         }
       }
@@ -1450,10 +1485,157 @@ Tool "\${name}" ran, but reading the page afterwards timed out (the page is stuc
         toolResult.content.push({ type: "text", text: handed });
 `,
   },
+  {
+    // Codex lanes. Codex sub-agents send no Claude tool_use id, but every
+    // call carries _meta["x-codex-turn-metadata"] with its thread_id. A Codex session's top-level
+    // thread keeps the "main" lane; each spawned sub-agent thread (parent_thread_id set) gets its
+    // own lane "cx<end of thread id>", so parallel Codex workers never share a current tab.
+    marker: '/*LANES_CODEX*/',
+    needle: `  const laneForCall = (meta) => {
+    const id = meta?.["claudecode/toolUseId"];
+`,
+    replacement: `  /*LANES_CODEX*/ const codexLaneSeen = globalThis.__pwCodexLaneSeen ??= new Map();
+  const laneForCall = (meta) => {
+    const codexMeta = meta?.["x-codex-turn-metadata"];
+    if (codexMeta && typeof codexMeta === "object" && !meta?.["claudecode/toolUseId"]) {
+      const thread = typeof codexMeta.thread_id === "string" && /^[\\w-]{1,128}$/.test(codexMeta.thread_id) ? codexMeta.thread_id : void 0;
+      if (!thread || !codexMeta.parent_thread_id)
+        return "main";
+      // Labels show a lane's first 8 characters, so lead with the random end of the thread id.
+      const lane = "cx" + thread.replace(/-/g, "").slice(-14);
+      if (!laneInfo.has(lane))
+        laneInfo.set(lane, { type: "codex " + (typeof codexMeta.agent_role === "string" ? codexMeta.agent_role : "worker") });
+      codexLaneSeen.set(lane, Date.now());
+      return lane;
+    }
+    const id = meta?.["claudecode/toolUseId"];
+`,
+  },
+  {
+    // Codex has no SubagentStop hook we can rely on (hooks need persisted trust), so a Codex
+    // sub-agent lane idle for 10 minutes is finished like a Claude helper: its tabs close, tabs it
+    // kept for the user are handed back. Sub-agents are told to close their own tabs anyway.
+    marker: '/*LANES_CODEX_IDLE*/',
+    needle: `  setInterval(() => void finishLanes().catch(serverDebug), 3e3).unref?.();
+`,
+    replacement: `  setInterval(() => void finishLanes().catch(serverDebug), 3e3).unref?.();
+  /*LANES_CODEX_IDLE*/ setInterval(() => void (async () => {
+    const seen = globalThis.__pwCodexLaneSeen;
+    if (!seen?.size)
+      return;
+    const context = backendPromise ? (await backendPromise.catch(() => null))?._context : void 0;
+    for (const [lane, at] of seen) {
+      if (Date.now() - at < 6e5)
+        continue;
+      await context?.finishLane?.(lane).catch(() => false);
+      seen.delete(lane);
+    }
+  })().catch(serverDebug), 6e4).unref?.();
+`,
+  },
+  {
+    // Element arguments are "target" (startTarget/endTarget for drag) in this Playwright, but models trained
+    // on older versions (some Codex sub-agents) send "ref", get "Invalid arguments ... at target" and
+    // spend a retry. No tool has an argument called ref, so take ref (and startRef/endRef) as the target,
+    // also inside arrays such as browser_fill_form's fields.
+    marker: '/*REF_ALIAS*/',
+    needle: '      const toolResult = await laneStore.run({ lane }, () => backend.callTool(request2.params.name, request2.params.arguments || {}, extra.signal));\n',
+    replacement: `      /*REF_ALIAS*/ const aliasRefs = (a) => {
+        if (!a || typeof a !== "object" || Array.isArray(a))
+          return;
+        for (const [from, to] of [["ref", "target"], ["startRef", "startTarget"], ["endRef", "endTarget"]]) {
+          if (a[from] !== void 0 && a[to] === void 0) {
+            a[to] = a[from];
+            delete a[from];
+          }
+        }
+        for (const v of Object.values(a)) {
+          if (Array.isArray(v))
+            v.forEach(aliasRefs);
+        }
+      };
+      // Only Playwright's own tools: a page's WebMCP tools (webmcp_*) may take an argument really called ref.
+      if (/^browser_/.test(request2.params.name || ""))
+        aliasRefs(request2.params.arguments);
+      const toolResult = await laneStore.run({ lane }, () => backend.callTool(request2.params.name, request2.params.arguments || {}, extra.signal));
+`,
+  },
+  {
+    // The code argument under the names models guess (a Codex sub-agent sent browser_evaluate {script}).
+    // Its own marker so an install that already has REF_ALIAS still gets it.
+    marker: '/*CODE_ARG_ALIAS*/',
+    // A bundle from the first runtime-7 build has this block without the marker (inside REF_ALIAS).
+    presentIf: 'const codeArg = { browser_evaluate: "function"',
+    needle: '      if (/^browser_/.test(request2.params.name || ""))\n        aliasRefs(request2.params.arguments);\n',
+    replacement: `      if (/^browser_/.test(request2.params.name || ""))
+        aliasRefs(request2.params.arguments);
+      /*CODE_ARG_ALIAS*/ const codeArg = { browser_evaluate: "function", browser_run_code_unsafe: "code" }[request2.params.name];
+      const codeArgs = request2.params.arguments;
+      if (codeArg && codeArgs && typeof codeArgs === "object" && codeArgs[codeArg] === void 0) {
+        for (const guess of ["script", "expression", "code", "function", "js", "fn"]) {
+          if (guess !== codeArg && typeof codeArgs[guess] === "string") {
+            codeArgs[codeArg] = codeArgs[guess];
+            delete codeArgs[guess];
+            break;
+          }
+        }
+      }
+`,
+  },
+  {
+    // A Codex session (codex exec job, one server per sub-agent run) never reconnects once it ends: remember
+    // that this server serves Codex, so SESSION_DONE tells the extension when its client is gone for good
+    // (build-extension.cjs 18). Checked at the end, so it doesn't matter which call set it.
+    marker: '/*CODEX_EPHEMERAL*/',
+    needle: '    const codexMeta = meta?.["x-codex-turn-metadata"];\n    if (codexMeta && typeof codexMeta === "object" && !meta?.["claudecode/toolUseId"]) {\n',
+    replacement: '    const codexMeta = meta?.["x-codex-turn-metadata"];\n    if (codexMeta && typeof codexMeta === "object" && !meta?.["claudecode/toolUseId"]) {\n      /*CODEX_EPHEMERAL*/ globalThis.__pwCodexClient = true;\n',
+  },
+  {
+    // The server's stdin ends only when its client is gone for good (the Codex job ended, or Codex killed the
+    // supervisor; a crash or a supervisor restart of this child doesn't end it). Then a Codex session tells the
+    // extension right away (playwright.sessionDone, build-extension.cjs 18), which settles its tabs at once
+    // instead of keeping them 3 min for a reconnect that never comes. Claude Code chats are left out: /mcp
+    // ends the old server and the new one must find its tabs. Sent synchronously from the first "end"
+    // listener, so the message leaves before the connection is closed.
+    marker: '/*SESSION_DONE*/',
+    needle: '  /*LANES_SERVER*/ let serverClosed = false;\n',
+    replacement: `  /*LANES_SERVER*/ let serverClosed = false;
+  /*SESSION_DONE*/ let sessionDoneSent = false;
+  const sendSessionDone = () => {
+    if (sessionDoneSent || !globalThis.__pwCodexClient)
+      return;
+    sessionDoneSent = true;
+    try {
+      void globalThis.__pwRelayModel?._sendToExtension?.("playwright.sessionDone", [{}])?.catch?.(() => {
+      });
+    } catch {
+    }
+  };
+  process.stdin.prependListener("end", sendSessionDone);
+  process.stdin.prependListener("close", sendSessionDone);
+`,
+  },
+  {
+    // A tab the agent didn't close vanished (LastPass & co. cut the debugger; the extension re-attaches it
+    // within a second, build-extension.cjs 16). The agent's next call must not open a blank tab in that
+    // gap, and a call that failed because of it should say the tab is back, so the agent retries in place
+    // instead of reopening the page and losing what it typed.
+    marker: '/*LOST_TAB_WAIT*/',
+    needle: '      const toolResult = await laneStore.run({ lane }, () => backend.callTool(request2.params.name, request2.params.arguments || {}, extra.signal));\n',
+    replacement: `      /*LOST_TAB_WAIT*/ await backend._context?.waitForLostTab?.(lane).catch(() => false);
+      const toolResult = await laneStore.run({ lane }, () => backend.callTool(request2.params.name, request2.params.arguments || {}, extra.signal));
+      try {
+        const failedOnLostTab = toolResult?.isError && /Target page, context or browser has been closed|Target closed|No open tabs/i.test(JSON.stringify(toolResult.content ?? ""));
+        if (failedOnLostTab && Array.isArray(toolResult.content) && await backend._context?.waitForLostTab?.(lane, 3e3, true).catch(() => false))
+          toolResult.content.push({ type: "text", text: "Your tab is back: another extension (such as LastPass) briefly cut the browser connection while this call ran. The page and what you typed before are still there. Take browser_snapshot (older refs no longer work), check whether this call's effect happened, and retry only this call if it did not. Don't reopen the page." });
+      } catch {
+      }
+`,
+  },
 ];
 
 for (const p of patches) {
-  if (src.includes(p.marker)) continue;
+  if (src.includes(p.marker) || (p.presentIf && src.includes(p.presentIf))) continue;
   if (p.start) {
     // Range patch: replace from `start` up to (not including) the next `end`.
     const a = src.indexOf(p.start);
@@ -1479,6 +1661,13 @@ for (const p of patches) {
 if (src === original) {
   console.log('already patched:', file);
 } else {
+  // Never write a bundle that doesn't parse (a broken patch would stop every new browser session).
+  try {
+    require('vm').compileFunction(src, ['exports', 'require', 'module', '__filename', '__dirname'], { filename: file });
+  } catch (e) {
+    console.error('patched bundle does not parse, nothing written:', e.message);
+    process.exit(1);
+  }
   if (!fs.existsSync(file + '.bak-original')) fs.writeFileSync(file + '.bak-original', original);
   fs.writeFileSync(file, src);
   console.log('patched:', file);
